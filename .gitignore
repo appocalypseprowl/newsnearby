@@ -21,4 +21,7 @@
 # Editor
 .idea
 
+# BoltDB
+*.db
+
 # End of https://www.gitignore.io/api/go
