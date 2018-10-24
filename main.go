@@ -5,18 +5,25 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
-	"github.com/boltdb/bolt"
+	bolt "go.etcd.io/bbolt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Location struct {
 	Name string  `json:"suburb"`
 	Lat  float64 `json:"lat"`
 	Lon  float64 `json:"lon"`
+}
+
+type Comparison struct {
+	Key      string
+	Distance float64
 }
 
 func setupDb(name string) {
@@ -51,7 +58,7 @@ loop:
 			continue
 		}
 
-		lon, err := strconv.ParseFloat(row[1], 64)
+		lon, err := strconv.ParseFloat(row[2], 64)
 		if err != nil {
 			continue
 		}
@@ -62,18 +69,159 @@ loop:
 	return locations, nil
 }
 
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
+func insertToDb(loc Location, bucketName string, dbName string) error {
+	db, err := bolt.Open(dbName, 0600, nil)
+	if err != nil {
+		log.Fatal(err)
 	}
+	defer db.Close()
 
-	parsed, err := parseGeoData("lat_lon.csv")
+	return db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+		if err != nil {
+			return fmt.Errorf("failed to create bucket: %v", err)
+		}
+
+		enc, err := json.Marshal(loc)
+		if err != nil {
+			return fmt.Errorf("failed to encode location '%s': %v", loc.Name, err)
+		}
+
+		if err := bucket.Put([]byte(loc.Name), enc); err != nil {
+			return fmt.Errorf("failed to insert '%s': %v", loc.Name, err)
+		}
+		return nil
+	})
+}
+
+func loadGeoData(path string, dbName string) {
+	locations, err := parseGeoData(path)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	b, err := json.Marshal(parsed)
+	for _, l := range locations {
+		if err := insertToDb(l, "lat_lon", dbName); err != nil {
+			log.Println(err)
+		}
+	}
+}
+
+func lookupGeoData(name string, bucketName string, db *bolt.DB) (Location, error) {
+	var loc Location
+
+	dbErr := db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(bucketName))
+		if bucket == nil {
+			return fmt.Errorf("failed to get '%s' bucket", bucketName)
+		}
+
+		b := bucket.Get([]byte(name))
+		if b == nil {
+			return fmt.Errorf("failed to find data for '%s'", name)
+		}
+
+		if err := json.Unmarshal(b, &loc); err != nil {
+			return fmt.Errorf("failed to unmarshal data for '%s'", name)
+		}
+
+		return nil
+	})
+
+	log.Println("loc:", loc)
+
+	return loc, dbErr
+}
+
+func haversine(theta float64) float64 {
+	return math.Pow(math.Sin(theta/2), 2)
+}
+
+func distance(lat1, lon1, lat2, lon2 float64) float64 {
+	// Convert to radians
+	// Must cast radius as float to multiply later
+	var la1, lo1, la2, lo2, r float64
+	la1 = lat1 * math.Pi / 180
+	lo1 = lon1 * math.Pi / 180
+	la2 = lat2 * math.Pi / 180
+	lo2 = lon2 * math.Pi / 180
+
+	r = 6378100 // Earth radius in meters
+
+	h := haversine(la2-la1) + math.Cos(la1)*math.Cos(la2)*haversine(lo2-lo1)
+
+	return 2 * r * math.Asin(math.Sqrt(h))
+}
+
+func findNearest(lat float64, lon float64, bucketName string, dbName string) (Location, error) {
+	db, err := bolt.Open(dbName, 0600, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	var comparisons []Comparison
+
+	compareEach := func(key, value []byte) error {
+		var loc Location
+		if err := json.Unmarshal(value, &loc); err == nil {
+			comparisons = append(comparisons, Comparison{
+				string(key),
+				distance(lat, lon, loc.Lat, loc.Lon),
+			})
+		}
+
+		return nil
+	}
+
+	db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(bucketName))
+		b.ForEach(compareEach)
+		return nil
+	})
+
+	min := Comparison{"", math.MaxFloat64}
+	for _, c := range comparisons {
+		if c.Distance < min.Distance {
+			min = c
+		}
+	}
+
+	return lookupGeoData(min.Key, "lat_lon", db)
+}
+
+func indexHandler(w http.ResponseWriter, r *http.Request) {
+	paths := strings.Split(r.URL.Path, "/")
+
+	if len(paths) < 3 {
+		http.NotFound(w, r)
+		return
+	}
+
+	if paths[1] != "newsfeed" || paths[2] != "location" {
+		http.NotFound(w, r)
+		return
+	}
+
+	param1 := r.URL.Query()["lat"][0]
+	param2 := r.URL.Query()["lon"][0]
+
+	lat, err := strconv.ParseFloat(param1, 64)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	lon, err := strconv.ParseFloat(param2, 64)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	out, err := findNearest(lat, lon, "lat_lon", "news_nearby.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	b, err := json.Marshal(out)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -85,6 +233,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	setupDb("news_nearby.db")
+	loadGeoData("lat_lon.csv", "news_nearby.db")
 
 	port := os.Getenv("PORT")
 	if port == "" {
