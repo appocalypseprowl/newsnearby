@@ -7,12 +7,15 @@ import (
 	"fmt"
 	bolt "go.etcd.io/bbolt"
 	"io"
+	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 type Location struct {
@@ -107,6 +110,98 @@ func loadGeoData(path string, dbName string) {
 	}
 }
 
+func upperCaseFirst(str string) string {
+	for i, v := range str {
+		return string(unicode.ToUpper(v)) + str[i+1:]
+	}
+	return ""
+}
+
+func sanitizeKey(key string) string {
+	var out string
+	out = strings.Replace(key, " NSW", "", 1)
+	out = strings.Replace(out, " VIC", "", 1)
+	out = strings.Replace(out, " QLD", "", 1)
+	out = strings.Replace(out, " TAS", "", 1)
+	return out
+}
+
+func saveToFeedDb(key string, data []byte, bucketName string, db *bolt.DB) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+		if err != nil {
+			return fmt.Errorf("failed to create bucket: %v", err)
+		}
+
+		if err := bucket.Put([]byte(key), data); err != nil {
+			return fmt.Errorf("failed to save to feed db '%s': %v", key, err)
+		}
+		return nil
+	})
+}
+
+func loadFeedData(dir string, feedDB string) {
+	db, err := bolt.Open(feedDB, 0600, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, f := range files {
+		var err error
+
+		path := filepath.Join(dir, f.Name())
+		b, err := ioutil.ReadFile(path)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		fname := upperCaseFirst(f.Name())
+		extn := filepath.Ext(f.Name())
+		key := fname[0 : len(fname)-len(extn)]
+
+		err = saveToFeedDb(key, b, "feed_data", db)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+}
+
+func lookupFeedData(key string, bucketName string, feedDB string) (SuburbRecord, error) {
+	db, err := bolt.Open(feedDB, 0600, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	var record SuburbRecord
+
+	dbErr := db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(bucketName))
+		if bucket == nil {
+			return fmt.Errorf("failed to get '%s' bucket", bucketName)
+		}
+
+		b := bucket.Get([]byte(key))
+		if b == nil {
+			return fmt.Errorf("failed to find data for '%s'", key)
+		}
+
+		if err := json.Unmarshal(b, &record); err != nil {
+			return fmt.Errorf("failed to unmarshal data for '%s'", key)
+		}
+
+		return nil
+	})
+
+	return record, dbErr
+}
+
 func lookupGeoData(name string, bucketName string, db *bolt.DB) (Location, error) {
 	var loc Location
 
@@ -127,8 +222,6 @@ func lookupGeoData(name string, bucketName string, db *bolt.DB) (Location, error
 
 		return nil
 	})
-
-	log.Println("loc:", loc)
 
 	return loc, dbErr
 }
@@ -216,12 +309,20 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		log.Fatal(err)
 	}
 
-	out, err := findNearest(lat, lon, "lat_lon", "news_nearby.db")
+	nearest, err := findNearest(lat, lon, "lat_lon", "news_nearby.db")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	b, err := json.Marshal(out)
+	sanitized := sanitizeKey(nearest.Name)
+
+	record, err := lookupFeedData(sanitized, "feed_data", "news_nearby.db")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	b, err := json.Marshal(record)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -234,6 +335,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	setupDb("news_nearby.db")
 	loadGeoData("lat_lon.csv", "news_nearby.db")
+	loadFeedData("./rawdata", "news_nearby.db")
 
 	port := os.Getenv("PORT")
 	if port == "" {
