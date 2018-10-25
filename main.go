@@ -302,14 +302,11 @@ func lookupRecordAndWriteRequest(key string, w http.ResponseWriter, r *http.Requ
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	paths := strings.Split(r.URL.Path, "/")
-	log.Println(paths)
 
 	if len(paths) < 3 {
 		http.NotFound(w, r)
 		return
 	}
-
-	log.Println("foo")
 
 	if paths[1] != "newsfeed" || paths[2] != "location" {
 		http.NotFound(w, r)
