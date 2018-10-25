@@ -283,40 +283,8 @@ func findNearest(lat float64, lon float64, bucketName string, dbName string) (Lo
 	return lookupGeoData(min.Key, "lat_lon", db)
 }
 
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	paths := strings.Split(r.URL.Path, "/")
-
-	if len(paths) < 3 {
-		http.NotFound(w, r)
-		return
-	}
-
-	if paths[1] != "newsfeed" || paths[2] != "location" {
-		http.NotFound(w, r)
-		return
-	}
-
-	param1 := r.URL.Query()["lat"][0]
-	param2 := r.URL.Query()["lon"][0]
-
-	lat, err := strconv.ParseFloat(param1, 64)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	lon, err := strconv.ParseFloat(param2, 64)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	nearest, err := findNearest(lat, lon, "lat_lon", "news_nearby.db")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	sanitized := sanitizeKey(nearest.Name)
-
-	record, err := lookupFeedData(sanitized, "feed_data", "news_nearby.db")
+func lookupRecordAndWriteRequest(key string, w http.ResponseWriter, r *http.Request) {
+	record, err := lookupFeedData(key, "feed_data", "news_nearby.db")
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -330,6 +298,53 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	w.Write(b)
+}
+
+func indexHandler(w http.ResponseWriter, r *http.Request) {
+	paths := strings.Split(r.URL.Path, "/")
+	log.Println(paths)
+
+	if len(paths) < 3 {
+		http.NotFound(w, r)
+		return
+	}
+
+	log.Println("foo")
+
+	if paths[1] != "newsfeed" || paths[2] != "location" {
+		http.NotFound(w, r)
+		return
+	}
+
+	suburbParam := r.URL.Query().Get("suburb")
+	if suburbParam != "" {
+		k := upperCaseFirst(suburbParam)
+		s := sanitizeKey(k)
+		lookupRecordAndWriteRequest(s, w, r)
+		return
+	}
+
+	latParam := r.URL.Query().Get("lat")
+	lonParam := r.URL.Query().Get("lon")
+
+	lat, err := strconv.ParseFloat(latParam, 64)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	lon, err := strconv.ParseFloat(lonParam, 64)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	nearest, err := findNearest(lat, lon, "lat_lon", "news_nearby.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sanitized := sanitizeKey(nearest.Name)
+
+	lookupRecordAndWriteRequest(sanitized, w, r)
 }
 
 func main() {
