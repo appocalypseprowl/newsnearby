@@ -1,6 +1,6 @@
 runtime: go
 env: flex
-api_version: 3
+api_version: 4
 
 manual_scaling:
   instances: 1
